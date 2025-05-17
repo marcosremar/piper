@@ -88,6 +88,7 @@ struct SynthesisResult {
   double inferSeconds;
   double audioSeconds;
   double realTimeFactor;
+  std::vector<int> phonemeLengths;
 };
 
 struct Voice {

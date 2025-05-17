@@ -57,16 +57,18 @@ def main() -> None:
         noise_scale = scales[0]
         length_scale = scales[1]
         noise_scale_w = scales[2]
-        audio = model_g.infer(
+        result = model_g.infer(
             text,
             text_lengths,
             noise_scale=noise_scale,
             length_scale=length_scale,
             noise_scale_w=noise_scale_w,
             sid=sid,
-        )[0].unsqueeze(1)
+        )
+        audio = result[0].unsqueeze(1)
+        w_ceil = result[1]  # Get phoneme lengths from the model output
 
-        return audio
+        return audio, w_ceil
 
     model_g.forward = infer_forward
 
@@ -92,11 +94,12 @@ def main() -> None:
         verbose=False,
         opset_version=OPSET_VERSION,
         input_names=["input", "input_lengths", "scales", "sid"],
-        output_names=["output"],
+        output_names=["output", "phoneme_lengths"],
         dynamic_axes={
             "input": {0: "batch_size", 1: "phonemes"},
             "input_lengths": {0: "batch_size"},
             "output": {0: "batch_size", 1: "time"},
+            "phoneme_lengths": {0: "batch_size", 1: "phonemes"},
         },
     )
 

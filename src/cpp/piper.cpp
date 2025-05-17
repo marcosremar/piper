@@ -333,110 +333,149 @@ void loadVoice(PiperConfig &config, std::string modelPath,
 
 } /* loadVoice */
 
-// Phoneme ids to WAV audio
+// Then modify the synthesize function to match the ModelSession struct in piper.hpp
 void synthesize(std::vector<PhonemeId> &phonemeIds,
                 SynthesisConfig &synthesisConfig, ModelSession &session,
                 std::vector<int16_t> &audioBuffer, SynthesisResult &result) {
-  spdlog::debug("Synthesizing audio for {} phoneme id(s)", phonemeIds.size());
-
-  auto memoryInfo = Ort::MemoryInfo::CreateCpu(
-      OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
-
-  // Allocate
-  std::vector<int64_t> phonemeIdLengths{(int64_t)phonemeIds.size()};
-  std::vector<float> scales{synthesisConfig.noiseScale,
-                            synthesisConfig.lengthScale,
-                            synthesisConfig.noiseW};
-
   std::vector<Ort::Value> inputTensors;
-  std::vector<int64_t> phonemeIdsShape{1, (int64_t)phonemeIds.size()};
-  inputTensors.push_back(Ort::Value::CreateTensor<int64_t>(
-      memoryInfo, phonemeIds.data(), phonemeIds.size(), phonemeIdsShape.data(),
-      phonemeIdsShape.size()));
 
-  std::vector<int64_t> phomemeIdLengthsShape{(int64_t)phonemeIdLengths.size()};
-  inputTensors.push_back(Ort::Value::CreateTensor<int64_t>(
-      memoryInfo, phonemeIdLengths.data(), phonemeIdLengths.size(),
-      phomemeIdLengthsShape.data(), phomemeIdLengthsShape.size()));
+  // Create memory info for CPU
+  Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
 
-  std::vector<int64_t> scalesShape{(int64_t)scales.size()};
-  inputTensors.push_back(
-      Ort::Value::CreateTensor<float>(memoryInfo, scales.data(), scales.size(),
-                                      scalesShape.data(), scalesShape.size()));
+  // -------------
+  // input[0] = phoneme ids
+  // -------------
+  std::vector<int64_t> inputShape{1, static_cast<int64_t>(phonemeIds.size())};
 
-  // Add speaker id.
-  // NOTE: These must be kept outside the "if" below to avoid being deallocated.
-  std::vector<int64_t> speakerId{
-      (int64_t)synthesisConfig.speakerId.value_or(0)};
-  std::vector<int64_t> speakerIdShape{(int64_t)speakerId.size()};
+  auto phonemeTensor = Ort::Value::CreateTensor<int64_t>(
+      memoryInfo, phonemeIds.data(), phonemeIds.size(),
+      inputShape.data(), inputShape.size());
 
-  if (synthesisConfig.speakerId) {
-    inputTensors.push_back(Ort::Value::CreateTensor<int64_t>(
-        memoryInfo, speakerId.data(), speakerId.size(), speakerIdShape.data(),
-        speakerIdShape.size()));
+  inputTensors.push_back(std::move(phonemeTensor));
+
+  // -------------
+  // input[1] = phoneme id lengths
+  // -------------
+  std::vector<int64_t> pIds{static_cast<int64_t>(phonemeIds.size())};
+  std::vector<int64_t> pIdsShape{1};
+
+  auto phonemeLengthsTensor = Ort::Value::CreateTensor<int64_t>(
+      memoryInfo, pIds.data(), pIds.size(), pIdsShape.data(),
+      pIdsShape.size());
+
+  inputTensors.push_back(std::move(phonemeLengthsTensor));
+
+  // -------------
+  // input[2] = scales (noise_scale, length_scale, noise_w)
+  // -------------
+  std::vector<float> scales{
+      synthesisConfig.noiseScale, synthesisConfig.lengthScale,
+      synthesisConfig.noiseW};
+  std::vector<int64_t> scalesShape{static_cast<int64_t>(scales.size())};
+
+  auto scalesTensor = Ort::Value::CreateTensor<float>(
+      memoryInfo, scales.data(), scales.size(), scalesShape.data(),
+      scalesShape.size());
+
+  inputTensors.push_back(std::move(scalesTensor));
+
+  // -------------
+  // input[3] = sid (speaker id, optional)
+  // -------------
+  std::vector<int64_t> sidShape{1};
+  std::vector<int64_t> sid{0};
+
+  if (synthesisConfig.speakerId.has_value()) {
+    sid[0] = static_cast<int64_t>(synthesisConfig.speakerId.value());
+
+    auto sidTensor = Ort::Value::CreateTensor<int64_t>(
+        memoryInfo, sid.data(), sid.size(), sidShape.data(),
+        sidShape.size());
+
+    inputTensors.push_back(std::move(sidTensor));
   }
 
-  // From export_onnx.py
-  std::array<const char *, 4> inputNames = {"input", "input_lengths", "scales",
-                                            "sid"};
-  std::array<const char *, 1> outputNames = {"output"};
+  // -----------------
+  // Convert to audio
+  // -----------------
+  std::chrono::steady_clock::time_point inferBegin =
+      std::chrono::steady_clock::now();
 
-  // Infer
-  auto startTime = std::chrono::steady_clock::now();
+  // Get input and output names
+  size_t numInputNodes = session.onnx.GetInputCount();
+  size_t numOutputNodes = session.onnx.GetOutputCount();
+  
+  std::vector<const char*> inputNames(numInputNodes);
+  std::vector<const char*> outputNames(numOutputNodes);
+  
+  // Use predefined input/output names since the API doesn't have a simple way to get them directly
+  const char* inputNamesArr[] = {"input", "input_lengths", "scales", "sid"};
+  const char* outputNamesArr[] = {"output", "phoneme_lengths"};
+  
+  for (size_t i = 0; i < numInputNodes && i < 4; i++) {
+    inputNames[i] = inputNamesArr[i];
+  }
+  
+  for (size_t i = 0; i < numOutputNodes && i < 2; i++) {
+    outputNames[i] = outputNamesArr[i];
+  }
+
   auto outputTensors = session.onnx.Run(
-      Ort::RunOptions{nullptr}, inputNames.data(), inputTensors.data(),
-      inputTensors.size(), outputNames.data(), outputNames.size());
-  auto endTime = std::chrono::steady_clock::now();
+      Ort::RunOptions{nullptr}, inputNames.data(),
+      inputTensors.data(), inputTensors.size(), outputNames.data(),
+      outputNames.size());
 
-  if ((outputTensors.size() != 1) || (!outputTensors.front().IsTensor())) {
-    throw std::runtime_error("Invalid output tensors");
-  }
-  auto inferDuration = std::chrono::duration<double>(endTime - startTime);
-  result.inferSeconds = inferDuration.count();
+  std::chrono::steady_clock::time_point inferEnd =
+      std::chrono::steady_clock::now();
 
-  const float *audio = outputTensors.front().GetTensorData<float>();
-  auto audioShape =
-      outputTensors.front().GetTensorTypeAndShapeInfo().GetShape();
-  int64_t audioCount = audioShape[audioShape.size() - 1];
+  result.inferSeconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            inferEnd - inferBegin).count() /
+                        1000.0;
 
-  result.audioSeconds = (double)audioCount / (double)synthesisConfig.sampleRate;
-  result.realTimeFactor = 0.0;
-  if (result.audioSeconds > 0) {
-    result.realTimeFactor = result.inferSeconds / result.audioSeconds;
-  }
-  spdlog::debug("Synthesized {} second(s) of audio in {} second(s)",
-                result.audioSeconds, result.inferSeconds);
+  // Handle both cases: models with only audio output (1 tensor) and models with audio + phoneme lengths (2 tensors)
+  assert(outputTensors.size() >= 1);
 
-  // Get max audio value for scaling
-  float maxAudioValue = 0.01f;
-  for (int64_t i = 0; i < audioCount; i++) {
-    float audioValue = abs(audio[i]);
-    if (audioValue > maxAudioValue) {
-      maxAudioValue = audioValue;
+  float *audioData = outputTensors[0].GetTensorMutableData<float>();
+  auto audioDims = outputTensors[0].GetTensorTypeAndShapeInfo().GetShape();
+
+  // Process phoneme lengths if available (model with timing output)
+  if (outputTensors.size() >= 2) {
+    int64_t *phonemeLengthsData = outputTensors[1].GetTensorMutableData<int64_t>();
+    auto phonemeLengthsDims = outputTensors[1].GetTensorTypeAndShapeInfo().GetShape();
+    
+    // Store phoneme lengths
+    size_t numPhonemes = 0;
+    if (phonemeLengthsDims.size() > 1) {
+      numPhonemes = phonemeLengthsDims[1]; // Assuming shape is [1, num_phonemes]
+    } else if (!phonemeLengthsDims.empty()) {
+      numPhonemes = phonemeLengthsDims[0];
     }
+    
+    result.phonemeLengths.clear();
+    for (size_t i = 0; i < numPhonemes; i++) {
+      result.phonemeLengths.push_back(static_cast<int>(phonemeLengthsData[i]));
+    }
+  } else {
+    // Model doesn't output phoneme lengths, clear the vector
+    result.phonemeLengths.clear();
   }
 
-  // We know the size up front
-  audioBuffer.reserve(audioCount);
+  // audio_dims is something like [1, 1, samples]
+  int64_t numSamples = audioDims.at(audioDims.size() - 1);
+  result.audioSeconds = numSamples / synthesisConfig.sampleRate;
+  result.realTimeFactor = result.inferSeconds / result.audioSeconds;
 
-  // Scale audio to fill range and convert to int16
-  float audioScale = (MAX_WAV_VALUE / std::max(0.01f, maxAudioValue));
-  for (int64_t i = 0; i < audioCount; i++) {
-    int16_t intAudioValue = static_cast<int16_t>(
-        std::clamp(audio[i] * audioScale,
-                   static_cast<float>(std::numeric_limits<int16_t>::min()),
-                   static_cast<float>(std::numeric_limits<int16_t>::max())));
+  // Convert float32 to int16
+  const auto audioScale = static_cast<float>(synthesisConfig.speakerId.has_value()
+                                                ? 32767.0f
+                                                : 32767.0f * 0.8f);
 
-    audioBuffer.push_back(intAudioValue);
-  }
+  audioBuffer.resize(numSamples);
 
-  // Clean up
-  for (std::size_t i = 0; i < outputTensors.size(); i++) {
-    Ort::detail::OrtRelease(outputTensors[i].release());
-  }
-
-  for (std::size_t i = 0; i < inputTensors.size(); i++) {
-    Ort::detail::OrtRelease(inputTensors[i].release());
+  for (int64_t i = 0; i < numSamples; i++) {
+    float audioSample = audioData[i];
+    audioSample = std::max(-1.0f, std::min(audioSample, 1.0f));
+    audioBuffer[i] = static_cast<int16_t>(audioSample * audioScale);
   }
 }
 

@@ -55,6 +55,9 @@ struct RunConfig {
   // Numerical id of the default speaker (multi-speaker voices)
   optional<piper::SpeakerId> speakerId;
 
+  // For multi-speaker models, the name of speaker to use (resolved to id)
+  optional<std::string> speakerName;
+
   // Amount of noise to add during audio generation
   optional<float> noiseScale;
 
@@ -88,6 +91,9 @@ struct RunConfig {
 
   // true to use CUDA execution provider
   bool useCuda = false;
+
+  // Output phoneme timing information as JSON to stdout
+  bool jsonTiming = false;
 };
 
 void parseArgs(int argc, char *argv[], RunConfig &runConfig);
@@ -227,6 +233,7 @@ int main(int argc, char *argv[]) {
   }
 
   string line;
+  vector<int16_t> audioBuffer;
   piper::SynthesisResult result;
   while (getline(cin, line)) {
     auto outputType = runConfig.outputType;
@@ -309,12 +316,11 @@ int main(int argc, char *argv[]) {
       piper::textToWavFile(piperConfig, voice, line, cout, result);
     } else if (outputType == OUTPUT_RAW) {
       // Raw output to stdout
-      mutex mutAudio;
-      condition_variable cvAudio;
       bool audioReady = false;
       bool audioFinished = false;
-      vector<int16_t> audioBuffer;
       vector<int16_t> sharedAudioBuffer;
+      mutex mutAudio;
+      condition_variable cvAudio;
 
 #ifdef _WIN32
       // Needed on Windows to avoid terminal conversions
@@ -322,9 +328,11 @@ int main(int argc, char *argv[]) {
       setmode(fileno(stdin), O_BINARY);
 #endif
 
+      // Start thread to handle audio output
       thread rawOutputThread(rawOutputProc, ref(sharedAudioBuffer),
                              ref(mutAudio), ref(cvAudio), ref(audioReady),
                              ref(audioFinished));
+
       auto audioCallback = [&audioBuffer, &sharedAudioBuffer, &mutAudio,
                             &cvAudio, &audioReady]() {
         // Signal thread that audio is ready
@@ -336,13 +344,13 @@ int main(int argc, char *argv[]) {
           cvAudio.notify_one();
         }
       };
+
       piper::textToAudio(piperConfig, voice, line, audioBuffer, result,
                          audioCallback);
 
       // Signal thread that there is no more audio
       {
         unique_lock lockAudio(mutAudio);
-        audioReady = true;
         audioFinished = true;
         cvAudio.notify_one();
       }
@@ -350,6 +358,60 @@ int main(int argc, char *argv[]) {
       // Wait for audio output to finish
       spdlog::info("Waiting for audio to finish playing...");
       rawOutputThread.join();
+    } else {
+      // Generate audio in one go
+      piper::textToAudio(piperConfig, voice, line, audioBuffer, result, NULL);
+      
+      // Debug prints
+      std::cout << "After textToAudio: " << (runConfig.jsonTiming ? "jsonTiming=true" : "jsonTiming=false")
+                << " phonemeLengths.size()=" << result.phonemeLengths.size() << std::endl;
+    }
+    
+    // Debug prints
+    std::cout << "Before jsonTiming condition: "
+              << (runConfig.jsonTiming ? "jsonTiming=true" : "jsonTiming=false")
+              << " phonemeLengths.size()=" << result.phonemeLengths.size() << std::endl;
+
+    // Se jsonTiming estiver ativado, gerar JSON com os tempos dos fonemas
+    if (runConfig.jsonTiming && !result.phonemeLengths.empty()) {
+      // Print debug information
+      std::cout << "Generating JSON timing data..." << std::endl;
+      std::cout << "Phoneme lengths: " << result.phonemeLengths.size() << std::endl;
+      
+      // Calcular taxa de amostragem em segundos
+      float sampleRate = static_cast<float>(voice.synthesisConfig.sampleRate);
+      
+      // Criar JSON com informações de timing dos fonemas
+      json timingJson;
+      timingJson["phoneme_count"] = result.phonemeLengths.size();
+      timingJson["sample_rate"] = sampleRate;
+      timingJson["audio_seconds"] = result.audioSeconds;
+      timingJson["text"] = line;
+      
+      // Calcular timing em segundos para cada fonema
+      float currentTime = 0.0f;
+      
+      timingJson["phonemes"] = json::array();
+      for (size_t i = 0; i < result.phonemeLengths.size(); i++) {
+        int phonemeLength = result.phonemeLengths[i];
+        float phonemeDuration = static_cast<float>(phonemeLength) / sampleRate;
+        
+        json phonemeInfo;
+        phonemeInfo["index"] = i;
+        phonemeInfo["length_samples"] = phonemeLength;
+        phonemeInfo["start_time"] = currentTime;
+        phonemeInfo["duration"] = phonemeDuration;
+        phonemeInfo["end_time"] = currentTime + phonemeDuration;
+        
+        timingJson["phonemes"].push_back(phonemeInfo);
+        
+        currentTime += phonemeDuration;
+      }
+      
+      timingJson["total_duration"] = currentTime;
+      
+      // Exibir o JSON na saída padrão
+      cout << timingJson.dump(2) << endl;
     }
 
     spdlog::info("Real-time factor: {} (infer={} sec, audio={} sec)",
@@ -359,6 +421,15 @@ int main(int argc, char *argv[]) {
     // Restore config (--json-input)
     voice.synthesisConfig.speakerId = speakerId;
 
+    if (runConfig.jsonTiming && !result.phonemeLengths.empty()) {
+      std::cout << "After textToAudio: " << (runConfig.jsonTiming ? "jsonTiming=true" : "jsonTiming=false")
+                << " phonemeLengths.size()=" << result.phonemeLengths.size() << std::endl;
+    }
+
+    // Print debug information before the if condition
+    std::cout << "Before jsonTiming condition: "
+              << (runConfig.jsonTiming ? "jsonTiming=true" : "jsonTiming=false")
+              << " phonemeLengths.size()=" << result.phonemeLengths.size() << std::endl;
   } // for each line
 
   piper::terminate(piperConfig);
@@ -402,24 +473,25 @@ void rawOutputProc(vector<int16_t> &sharedAudioBuffer, mutex &mutAudio,
 // ----------------------------------------------------------------------------
 
 void printUsage(char *argv[]) {
-  cerr << endl;
-  cerr << "usage: " << argv[0] << " [options]" << endl;
-  cerr << endl;
-  cerr << "options:" << endl;
-  cerr << "   -h        --help              show this message and exit" << endl;
-  cerr << "   -m  FILE  --model       FILE  path to onnx model file" << endl;
-  cerr << "   -c  FILE  --config      FILE  path to model config file "
-          "(default: model path + .json)"
+  cout << endl;
+  cout << "Usage: " << argv[0]
+       << " --model /path/to/file.onnx [options]" << endl;
+  cout << endl;
+  cout << "Required Arguments:" << endl;
+  cout << "  -m, --model    Path to onnx model file (-m)" << endl;
+  cout << endl;
+  cout << "Input/Output:" << endl;
+  cout << "  -o,  --output_file    Path to output WAV file (default: "
+          "output.wav)"
        << endl;
-  cerr << "   -f  FILE  --output_file FILE  path to output WAV file ('-' for "
-          "stdout)"
+  cout << "  -od, --output_dir     Path to output directory (default: "
+          "current)"
        << endl;
-  cerr << "   -d  DIR   --output_dir  DIR   path to output directory (default: "
-          "cwd)"
-       << endl;
-  cerr << "   --output_raw                  output raw audio to stdout as it "
-          "becomes available"
-       << endl;
+  cout << "  -r,  --output-raw     Output raw audio to stdout" << endl;
+  cout << "  -j,  --json-input     Input lines are JSON objects" << endl;
+  cout << "  -jt, --json_timing    Output phoneme timing information as JSON" << endl;
+  cout << endl;
+  cout << "Synthesis:" << endl;
   cerr << "   -s  NUM   --speaker     NUM   id of speaker (default: 0)" << endl;
   cerr << "   --noise_scale           NUM   generator noise (default: 0.667)"
        << endl;
@@ -434,9 +506,6 @@ void printUsage(char *argv[]) {
        << endl;
   cerr << "   --tashkeel_model        FILE  path to libtashkeel onnx model "
           "(arabic)"
-       << endl;
-  cerr << "   --json-input                  stdin input is lines of JSON "
-          "instead of plain text"
        << endl;
   cerr << "   --use-cuda                    use CUDA execution provider"
        << endl;
@@ -455,37 +524,60 @@ void ensureArg(int argc, char *argv[], int argi) {
 
 // Parse command-line arguments
 void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
-  optional<filesystem::path> modelConfigPath;
+  if (argc < 2) {
+    printUsage(argv);
+    exit(1);
+  }
 
   for (int i = 1; i < argc; i++) {
-    std::string arg = argv[i];
-
-    if (arg == "-m" || arg == "--model") {
+    string arg = argv[i];
+    if ((arg == "--help") || (arg == "-h")) {
+      printUsage(argv);
+      exit(0);
+    } else if (arg == "--model" || arg == "-m") {
       ensureArg(argc, argv, i);
       runConfig.modelPath = filesystem::path(argv[++i]);
-    } else if (arg == "-c" || arg == "--config") {
-      ensureArg(argc, argv, i);
-      modelConfigPath = filesystem::path(argv[++i]);
-    } else if (arg == "-f" || arg == "--output_file" ||
-               arg == "--output-file") {
-      ensureArg(argc, argv, i);
-      std::string filePath = argv[++i];
-      if (filePath == "-") {
-        runConfig.outputType = OUTPUT_STDOUT;
-        runConfig.outputPath = nullopt;
-      } else {
-        runConfig.outputType = OUTPUT_FILE;
-        runConfig.outputPath = filesystem::path(filePath);
+
+      if (!runConfig.modelConfigPath.has_filename()) {
+        // Default config path is model path + .json
+        runConfig.modelConfigPath =
+            filesystem::path(string(runConfig.modelPath.string()) + ".json");
       }
-    } else if (arg == "-d" || arg == "--output_dir" || arg == "output-dir") {
+    } else if (arg == "--model-config" || arg == "-mc") {
+      ensureArg(argc, argv, i);
+      runConfig.modelConfigPath = filesystem::path(argv[++i]);
+    } else if (arg == "--output_file" || arg == "-o") {
+      ensureArg(argc, argv, i);
+      runConfig.outputType = OUTPUT_FILE;
+      runConfig.outputPath = filesystem::path(argv[++i]);
+    } else if (arg == "--output_dir" || arg == "-od") {
       ensureArg(argc, argv, i);
       runConfig.outputType = OUTPUT_DIRECTORY;
       runConfig.outputPath = filesystem::path(argv[++i]);
-    } else if (arg == "--output_raw" || arg == "--output-raw") {
+    } else if (arg == "--output-raw" || arg == "-r") {
       runConfig.outputType = OUTPUT_RAW;
-    } else if (arg == "-s" || arg == "--speaker") {
+    } else if (arg == "--cuda" || arg == "-c") {
+      runConfig.useCuda = true;
+    } else if (arg == "--json-input" || arg == "-j") {
+      runConfig.jsonInput = true;
+    } else if (arg == "--json_timing" || arg == "-jt") {
+      runConfig.jsonTiming = true;
+      std::cout << "JSON timing enabled" << std::endl;
+    } else if (arg == "--speaker" || arg == "-s") {
       ensureArg(argc, argv, i);
-      runConfig.speakerId = (piper::SpeakerId)stol(argv[++i]);
+      try {
+        try {
+          // Try to parse as integer speaker id
+          runConfig.speakerId = stoi(argv[++i]);
+        } catch (const exception &) {
+          // Try to parse as string speaker name (will be resolved later)
+          runConfig.speakerName = string(argv[i]);
+          runConfig.speakerId = nullopt;
+        }
+      } catch (const exception &e) {
+        spdlog::error("--speaker requires an id or name");
+        exit(1);
+      }
     } else if (arg == "--noise_scale" || arg == "--noise-scale") {
       ensureArg(argc, argv, i);
       runConfig.noiseScale = stof(argv[++i]);
@@ -521,10 +613,6 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
     } else if (arg == "--tashkeel_model" || arg == "--tashkeel-model") {
       ensureArg(argc, argv, i);
       runConfig.tashkeelModelPath = filesystem::path(argv[++i]);
-    } else if (arg == "--json_input" || arg == "--json-input") {
-      runConfig.jsonInput = true;
-    } else if (arg == "--use_cuda" || arg == "--use-cuda") {
-      runConfig.useCuda = true;
     } else if (arg == "--version") {
       std::cout << piper::getVersion() << std::endl;
       exit(0);
@@ -534,9 +622,6 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
     } else if (arg == "-q" || arg == "--quiet") {
       // diable logging
       spdlog::set_level(spdlog::level::off);
-    } else if (arg == "-h" || arg == "--help") {
-      printUsage(argv);
-      exit(0);
     }
   }
 
@@ -546,11 +631,9 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
     throw runtime_error("Model file doesn't exist");
   }
 
-  if (!modelConfigPath) {
+  if (!runConfig.modelConfigPath.has_filename()) {
     runConfig.modelConfigPath =
         filesystem::path(runConfig.modelPath.string() + ".json");
-  } else {
-    runConfig.modelConfigPath = modelConfigPath.value();
   }
 
   // Verify model config exists
